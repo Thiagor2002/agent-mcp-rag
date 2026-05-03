@@ -167,12 +167,12 @@ class ToolExecutionError(BaseAgentError):
 
 class MemoryAccessError(BaseAgentError):
     """内存访问异常，当Agent访问内存时发生错误"""
-    
-    def __init__(self, message: str, operation: str, 
+
+    def __init__(self, message: str, operation: str,
                  agent_id: Optional[str] = None):
         """
         初始化内存访问异常
-        
+
         Args:
             message: 错误消息
             operation: 执行的操作
@@ -181,14 +181,39 @@ class MemoryAccessError(BaseAgentError):
         details = {
             "operation": operation
         }
-        
+
         if agent_id:
             details["agent_id"] = agent_id
-        
+
         super().__init__(
             message=message,
             error_code="MEMORY_ACCESS_ERROR",
             details=details
         )
         self.operation = operation
-        self.agent_id = agent_id 
+        self.agent_id = agent_id
+
+
+class ToolError(BaseAgentError):
+    """工具相关异常，当工具注册、查找或执行过程中发生错误时抛出"""
+
+    def __init__(self, message: str, tool_name: Optional[str] = None,
+                 details: Optional[Dict[str, Any]] = None):
+        """
+        初始化工具异常
+
+        Args:
+            message: 错误消息
+            tool_name: 工具名称
+            details: 错误详情
+        """
+        details = details or {}
+        if tool_name:
+            details["tool_name"] = tool_name
+
+        super().__init__(
+            message=message,
+            error_code="TOOL_ERROR",
+            details=details
+        )
+        self.tool_name = tool_name

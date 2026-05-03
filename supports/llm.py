@@ -467,61 +467,60 @@ class LLMInterface:
             raise ValueError(f"不支持的模型类型: {self.config.model_type}")
     
     def _prepare_messages(
-        self, 
-        prompt: str, 
+        self,
+        prompt: str,
         context: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, str]]:
         """
-        准备消息列表: 
-        1. 如果context中已经包含messages，直接使用；
-        如果最后一条已经是用户消息，则更新内容，否则添加新的用户消息.
-        2. 创建新消息列表
-        
+        准备消息列表
+
+        支持两种输入模式:
+        1. context 为消息列表 (List[Dict]): 直接使用并追加当前 prompt
+        2. context 为字典: 从 history / messages 等字段构建消息列表
+
         Args:
             prompt: 提示文本
             context: 上下文信息
-            
+
         Returns:
             消息列表
         """
-        return context
-    
-        if context and "messages" in context:
-            messages = context["messages"]
-            # 确保最后一条消息是当前提示
-            if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
-                messages[-1]["content"] = prompt
-            else:
+        # 模式1: context 已经是消息列表
+        if isinstance(context, list):
+            messages = list(context)
+            if prompt:
                 messages.append({"role": "user", "content": prompt})
-                
             return messages
-        
-        # 否则创建新的消息列表
-        system_message = (context or {}).get("system_message", "你是一个有用的AI助手。")
-        
+
+        # 模式2: context 是字典，包含 messages 或 history
+        if context and isinstance(context, dict):
+            if "messages" in context:
+                messages = list(context["messages"])
+                if prompt and messages and isinstance(messages[-1], dict) \
+                   and messages[-1].get("role") == "user":
+                    messages[-1]["content"] = prompt
+                elif prompt:
+                    messages.append({"role": "user", "content": prompt})
+                return messages
+
+            if "history" in context:
+                system_message = context.get("system_message", "你是一个有用的AI助手。")
+                messages = [{"role": "system", "content": system_message}]
+                for entry in context["history"]:
+                    if "user" in entry:
+                        messages.append({"role": "user", "content": entry["user"]})
+                    if "assistant" in entry:
+                        messages.append({"role": "assistant", "content": entry["assistant"]})
+                if prompt:
+                    messages.append({"role": "user", "content": prompt})
+                return messages
+
+        # 模式3: 无上下文，构建最简消息列表
         messages = [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": prompt}
+            {"role": "system", "content": "你是一个有用的AI助手。"},
         ]
-        
-        # 如果上下文中有历史消息，添加到messages中
-        if context and "history" in context:
-            history = context["history"]
-            
-            # 构建完整的消息列表
-            full_messages = [{"role": "system", "content": system_message}]
-            
-            for entry in history:
-                if "user" in entry:
-                    full_messages.append({"role": "user", "content": entry["user"]})
-                if "assistant" in entry:
-                    full_messages.append({"role": "assistant", "content": entry["assistant"]})
-            
-            # 添加当前提示
-            full_messages.append({"role": "user", "content": prompt})
-            
-            messages = full_messages
-        
+        if prompt:
+            messages.append({"role": "user", "content": prompt})
         return messages
     
     def _generate_openai(
@@ -933,8 +932,158 @@ class LLMInterface:
                 # Google API目前没有系统消息，将其作为用户消息添加
                 google_messages.append({"role": "user", "parts": [{"text": f"System: {msg['content']}"}]})
         
-        # 创建模型
+        # 创建模型并生成
+        model = genai.GenerativeModel(
+            model_name=self.config.model_name,
+            generation_config={
+                "temperature": self.config.temperature,
+                "top_p": self.config.top_p,
+                "max_output_tokens": self.config.max_tokens,
+            }
+        )
 
+        # 发送请求
+        for retry in range(self.config.max_retries + 1):
+            try:
+                start_time = time.time()
 
+                if self.config.stream:
+                    response_stream = model.generate_content(
+                        google_messages,
+                        stream=True,
+                    )
+                    collected_content = ""
+                    for chunk in response_stream:
+                        if chunk.text:
+                            collected_content += chunk.text
+                    response = {
+                        "id": f"gemini-{int(time.time())}",
+                        "model": self.config.model_name,
+                        "content": collected_content,
+                        "finish_reason": "stop",
+                        "usage": {
+                            "prompt_tokens": self.token_counter.count_messages_tokens(messages),
+                            "completion_tokens": self.token_counter.count_tokens(collected_content),
+                            "total_tokens": (
+                                self.token_counter.count_messages_tokens(messages) +
+                                self.token_counter.count_tokens(collected_content)
+                            )
+                        }
+                    }
+                else:
+                    response_obj = model.generate_content(google_messages)
+                    response = {
+                        "id": f"gemini-{int(time.time())}",
+                        "model": self.config.model_name,
+                        "content": response_obj.text,
+                        "finish_reason": "stop",
+                        "usage": {
+                            "prompt_tokens": self.token_counter.count_messages_tokens(messages),
+                            "completion_tokens": self.token_counter.count_tokens(response_obj.text),
+                            "total_tokens": (
+                                self.token_counter.count_messages_tokens(messages) +
+                                self.token_counter.count_tokens(response_obj.text)
+                            )
+                        }
+                    }
 
+                elapsed = time.time() - start_time
+                logger.debug(f"Google 响应耗时: {elapsed:.2f}秒")
+                return response
 
+            except Exception as e:
+                if retry < self.config.max_retries:
+                    delay = self.config.retry_delay * (2 ** retry)
+                    logger.warning(
+                        f"Google 请求失败 ({retry+1}/{self.config.max_retries}): {e}，"
+                        f"将在 {delay} 秒后重试"
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error(f"Google 请求失败，已达到最大重试次数: {e}")
+                    raise
+
+    def _generate_huggingface(
+        self,
+        messages: List[Dict[str, str]],
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        使用 HuggingFace 推理 API 生成文本
+
+        Args:
+            messages: 消息列表
+            **kwargs: 其他参数
+
+        Returns:
+            生成结果
+        """
+        url = f"{self.config.base_url}/{self.config.model_name}"
+
+        # 将消息转换为 HuggingFace 格式的 prompt
+        prompt_parts = []
+        for msg in messages:
+            if msg["role"] == "system":
+                prompt_parts.append(f"System: {msg['content']}")
+            elif msg["role"] == "user":
+                prompt_parts.append(f"Human: {msg['content']}")
+            elif msg["role"] == "assistant":
+                prompt_parts.append(f"Assistant: {msg['content']}")
+        prompt_parts.append("Assistant:")
+        prompt = "\n".join(prompt_parts)
+
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": self.config.max_tokens,
+                "temperature": self.config.temperature,
+                "top_p": self.config.top_p,
+            }
+        }
+
+        for retry in range(self.config.max_retries + 1):
+            try:
+                start_time = time.time()
+                response_obj = requests.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=self.config.timeout,
+                )
+                response_obj.raise_for_status()
+                data = response_obj.json()
+
+                content = data[0].get("generated_text", "") if isinstance(data, list) else str(data)
+                elapsed = time.time() - start_time
+                logger.debug(f"HuggingFace 响应耗时: {elapsed:.2f}秒")
+
+                return {
+                    "id": f"hf-{int(time.time())}",
+                    "model": self.config.model_name,
+                    "content": content,
+                    "finish_reason": "stop",
+                    "usage": {
+                        "prompt_tokens": self.token_counter.count_tokens(prompt),
+                        "completion_tokens": self.token_counter.count_tokens(content),
+                        "total_tokens": (
+                            self.token_counter.count_tokens(prompt) +
+                            self.token_counter.count_tokens(content)
+                        )
+                    }
+                }
+
+            except Exception as e:
+                if retry < self.config.max_retries:
+                    delay = self.config.retry_delay * (2 ** retry)
+                    logger.warning(
+                        f"HuggingFace 请求失败 ({retry+1}/{self.config.max_retries}): {e}，"
+                        f"将在 {delay} 秒后重试"
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error(f"HuggingFace 请求失败，已达到最大重试次数: {e}")
+                    raise
